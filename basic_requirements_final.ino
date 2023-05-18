@@ -7,13 +7,13 @@
 #include <WiFiUdp.h>
 #include <NTPClient.h>
 
-const char* ssid = "Hostel";
-const char* password = "";
+const char* ssid = "YOUR WIFI SSID";
+const char* password = "YOUR PASSWORD";
 
-const char* adminUsername = "bhavishya";
-const char* adminPassword = "madan123";
-const char* userUsername = "divyansh";
-const char* userPassword = "khandekar123";
+const char* adminUsername = "Admin";
+const char* adminPassword = "admin123";
+const char* userUsername = "user";
+const char* userPassword = "user123";
 
 const int relayPin1 = 1;
 const int relayPin2 = 2;
