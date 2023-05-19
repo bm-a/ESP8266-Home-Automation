@@ -88,7 +88,7 @@ Please refer to the individual source files for any additional licenses or attri
 
 We acknowledge the contributions and inspiration from various open-source projects and the ESP8266 community.
 
-If you encounter any issues or have any questions, please feel free to open an issue in this repository. We appreciate your feedback and contributions to improving this codebase.
+If you encounter any issues or have any questions, please feel free to open an issue in this repository. We appreciate your feedback and contributions to improving this codebase. And also for any feature request.
 
 Thank you and happy coding!
 Please contact me here in case of any queries
