@@ -1,7 +1,7 @@
 # ESP8266-Home-Automation
 THIS CODE IS STILL IN DEVELOPMENT AND ANY BUGS AND REPORTS SHALL BE HIGHLY ENCOURAGED 
-## Go here to learn more -> https://github.com/bm-a/ESP8266-Home-Automation/wiki (see Wiki for any further information.)
-
+##  See Wiki for any further information.(
+Go here to learn more -> https://github.com/bm-a/ESP8266-Home-Automation/wiki )
 
 
 This repository contains the code for controlling relays and managing Wi-Fi connections using ESP8266 microcontroller. The code provides functionalities such as relay control, synchronization with NTP server, Wi-Fi management, logging, and web page interface with authentication.
