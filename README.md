@@ -79,7 +79,7 @@ Note: Ensure that your ESP8266 is connected to the same network as the computer 
 
 ## License
 
-This code is released under the [MIT License](https://opensource.org/licenses/MIT).
+This code is released under the GPL-3.0 LICENCE 
 
 Please refer to the individual source files for any additional licenses or attributions.
 
