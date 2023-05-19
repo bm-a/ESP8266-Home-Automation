@@ -40,7 +40,7 @@ To run the ESP8266 code, you will need the following components:
 
    - Change Hotspot Settings: The admin user can turn on the hotspot when the Wi-Fi connection is not available.
 
-   - Login Page for "Hostel" Wi-Fi: Displays an iframe with a login page for the "Hostel" Wi-Fi network at URL: http://192.168.1.1:8090/httpclient.html. THIS WAS THE LOGIN PAGE IN MY CASE JUST COMMENT OUT THE CODE IN CASE YOU DON'T WANT THIS
+   - Login Page for "" Wi-Fi: Displays an iframe with a login page for the "" Wi-Fi network at URL: ( http://192.168.1.1:8090/httpclient.html ). THIS WAS THE LOGIN PAGE IN MY CASE JUST COMMENT OUT THE CODE IN CASE YOU DON'T WANT THIS
 
    - Display Logs: The admin user can view the logs in a container on the web page.
 
