@@ -64,7 +64,6 @@ To generate the firmware bin file and perform OTA updates, follow these steps:
 
 5. Select the appropriate board and COM port in the Arduino IDE
 
-.
 
 6. Click on "Sketch" > "Export compiled Binary" to generate the bin file.
 
