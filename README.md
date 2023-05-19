@@ -95,7 +95,7 @@ bhavishyamadan@gmail.com
 
 
 
-you can also consider supporting me 
-https://www.paypal.me/bhavishyamadan
+
+
 
 
