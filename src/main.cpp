@@ -1,4 +1,4 @@
-// ESP8266 Home Automation v4 — 4 relays + 4 switches, captive-portal WiFi,
+// ESP8266 Home Automation v1.0 — 4 relays + 4 switches, captive-portal WiFi,
 // authenticated web UI + JSON API, event log, NTP, OTA. See README.md.
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -64,7 +64,7 @@ static void applyRelayPin(int ch) {
 void setup() {
   Serial.begin(115200);
   Serial.println();
-  Serial.println("ESP-Home v4 booting");
+  Serial.println("ESP-Home v1.0 booting");
 
   if (!fsBegin(true)) Serial.println("FS mount failed!");
 

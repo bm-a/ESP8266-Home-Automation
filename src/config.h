@@ -1,4 +1,4 @@
-// Hardware + behavior configuration for v4.
+// Hardware + behavior configuration for v1.0.
 //
 // PIN MAP (generic ESP8266 dev module / ESP-12E / NodeMCU):
 //   Relays  D1 D2 D6 D7 = GPIO 5,4,12,13  (no strapping, no UART, no flash bus)

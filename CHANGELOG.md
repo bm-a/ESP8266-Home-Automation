@@ -1,6 +1,6 @@
 # Changelog
 
-## v4.0.0 (2026-09-19) — full rewrite
+## v1.0 (2026-09-19) — first release (full rewrite of the v3 sketch)
 - PlatformIO project: modular `src/` (logic / device / common) + Unity tests
   (34 assertions) + 30-day soak sim + CI.
 - Correct ESP8266 pin map: relays GPIO 5/4/12/13, switches GPIO 14/16/0/2
