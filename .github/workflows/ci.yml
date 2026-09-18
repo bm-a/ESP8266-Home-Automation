@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Unity tests (native)
+        run: pio test -e native
+      - name: Soak sim
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Isrc/logic -Isrc/common \
+            tools/soak_sim.cpp src/logic/relay.cpp src/logic/debounce.cpp \
+            src/logic/logstore.cpp src/logic/auth.cpp src/common/sha256.cpp \
+            -o /tmp/ha_soak
+          /tmp/ha_soak
+
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build ESP8266 firmware
+        run: pio run -e esp12e
+      - name: Arduino sketch mirror is fresh
+        run: |
+          python3 tools/mirror_to_ino.py
+          git diff --exit-code -- arduino/ || (echo "Run tools/mirror_to_ino.py and commit"; exit 1)
+      - name: Generated sketch compiles
+        run: sh tools/check_ino.sh

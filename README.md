@@ -1,101 +1,70 @@
-# ESP8266-Home-Automation
-THIS CODE IS STILL IN DEVELOPMENT AND ANY BUGS AND REPORTS SHALL BE HIGHLY ENCOURAGED 
-##  See Wiki for any further information.
- ( https://github.com/bm-a/ESP8266-Home-Automation/wiki )
+# ESP8266 Home Automation v4
 
+4-channel relay control with physical switches, captive-portal WiFi, authenticated
+web UI + JSON API, event logging, NTP time, and dual OTA — on a generic ESP8266
+dev module (ESP-12E / NodeMCU / Wemos D1 mini).
 
-This repository contains the code for controlling relays and managing Wi-Fi connections using ESP8266 microcontroller. The code provides functionalities such as relay control, synchronization with NTP server, Wi-Fi management, logging, and web page interface with authentication.
+> v4 is a from-scratch rewrite. The original v3 sketch is preserved in `legacy/`;
+> see `CHANGELOG.md` for what was broken and fixed.
 
-## Requirements
+## Wiring
 
-To run the ESP8266 code, you will need the following components:
+| Function | GPIO | Board label | Notes |
+|---|---|---|---|
+| Relay 1–4 IN | 5, 4, 12, 13 | D1, D2, D6, D7 | Active-LOW modules assumed (`RELAY_ACTIVE_LOW`, flip if yours differ) |
+| Switch 1–4 | 14, 16, 0, 2 | D5, D0, FLASH, D4 | Buttons to GND |
+| Relay VCC/JD-VCC | 5 V supply | — | Keep relay coil power separate from ESP 3V3 if 4 relays chatter |
+| ESP power | USB 5 V | — | Never mains without an isolated supply |
 
-- ESP8266 microcontroller
+- **GPIO16 (switch 2)** has no internal pull-up: add a **10 kΩ resistor to 3V3**.
+- Switches 1/3/4 use internal pull-ups; GPIO0/2 wiring mirrors the FLASH button (safe).
+- Relay board inputs to the GPIOs above; relay VCC to 5 V; common GND.
+- Onboard LED (GPIO2) is switch 4's pin — read as input only, never driven.
 
-- Relays connected to pins 1, 2, 3, and 4 (modify according to your needs)
+## First boot
 
-- Manual switches connected to pins 5, 6, 7, and 8 (modify according to your needs)
+1. Flash (PlatformIO `pio run -e esp12e -t upload`, or Arduino IDE sketch in `arduino/`).
+2. Board opens AP **`ESP-Setup-XXXX`** → join it → captive page asks for home WiFi.
+3. If WiFi never connects, the board still runs standalone (relays + switches work; portal retries in background).
+4. Browse to the IP (or `esp-home.local`) → **set the admin password** (≥ 8 chars). Nothing else works until you do — there are no default logins.
+5. Optional: Settings → enable the limited `user` account (relays only), change OTA password.
 
-- Internet connectivity for NTP synchronization
+Hold **switch 1 for 8 s** any time to reopen the WiFi portal (5-min timeout).
 
-- Wi-Fi network (CONFIFURE THE SSID AND PASSWORD ACCORDINGLY)
+## Web UI / API
 
-## Functionality
+- `/` dashboard (relay states, live poll), `/logs` (admin), `/settings` (admin), `/update` (admin firmware upload), `/setup` (first boot).
+- `GET /api/state` → `{time, ip, rssi, ntp, uptime, relays[]}`.
+- `POST /api/relay` with `ch=` + `on=1/0` (omit `on` to toggle); legacy `POST /relay/<i>` toggles.
+- Auth: HTTP Basic, roles `admin` (everything) / `user` (relays + state only).
 
-1. Relay Control: The code enables the control of relays connected to pins 1, 2, 3, and 4. You can toggle the relays on or off using the web page interface.
+## Build & test
 
-2. Manual Switches: The manual switches connected to pins 5, 6, 7, and 8 allow you to manually control the relays.
+```sh
+pio test -e native     # 34 Unity assertions (relay, debounce, log, auth, scheduler, SHA-256)
+sh run_tests.sh        # above + 30-day soak sim (switch storms, WiFi drops, millis wrap)
+pio run -e esp12e      # firmware
+python3 tools/mirror_to_ino.py   # regenerate Arduino sketch after editing src/
+```
 
-3. NTP Time Synchronization: The code synchronizes the time with an NTP server, such as NTP India, every 5 minutes. This ensures accurate timekeeping for various functionalities. MY WIFI HAS A LOGOUT FEATURE IN CASE THERE IS NO INTERNET ACTIVITY FOR 15 MINUTES SO I DID THAT. YOU CAN CHANGE THE SYNC TIME ACCORDING TO YOUR NEEDS
+## Repo layout
 
-4. Wi-Fi Connection Management: The code maintains a continuous Wi-Fi connection. It provides a hotspot with SSID "esp" and password "esp" when the Wi-Fi is not connected. You can configure the ssid of wifi and hotspot using this.
+```
+src/logic/    hardware-independent core (tested on host)
+src/device/   ESP8266 drivers: portal, web UI, OTA, NTP, storage
+src/common/   shared SHA-256
+src/main.cpp  wiring + loop
+test/         Unity suites   tools/soak_sim.cpp   tools/mirror_to_ino.py
+arduino/      generated single-file sketch (Arduino IDE)
+legacy/       original v3 sketch, untouched
+```
 
-5. Logging: The code generates a log file that includes information on relay toggling, Wi-Fi password changes, and user logins. Logs older than 30 days are automatically deleted by editing the log file. The logs can be accessed by the admin user through a container on the web page.
+## Security notes
 
-6. Web Page Interface: The code provides a web page with the following functionalities:
-
-   - Toggle Relays: Allows users to toggle the state of the relays.
-
-   - Change Wi-Fi Credentials: Only accessible to the admin user, this feature enables changing the Wi-Fi credentials.
-
-   - Change Hotspot Settings: The admin user can turn on the hotspot when the Wi-Fi connection is not available.
-
-   - Login Page for "" Wi-Fi: Displays an iframe with a login page for the "" Wi-Fi network at URL: ( http://192.168.1.1:8090/httpclient.html ). THIS WAS THE LOGIN PAGE IN MY CASE JUST COMMENT OUT THE CODE IN CASE YOU DON'T WANT THIS
-
-   - Display Logs: The admin user can view the logs in a container on the web page.
-
-7. Authentication: The code implements an authentication webpage with an administrator account ("admin," password: "admin") and a user account ("user," password: "user"). The user account has limited access and cannot change Wi-Fi or hotspot settings, view logs, or see usernames other than the available options in the drop-down menu. Only the administrator can access logs and change Wi-Fi/hotspot credentials.
-
-8. OTA Updates: The ESP8266 is enabled to receive firmware updates wirelessly using the OTA functionality. A graphical interface allows users to upload the firmware bin file and trigger OTA updates wirelessly. Please follow the procedure below to generate the bin file.
-
-9. CSS Styles: The web page is styled with a pixel-themed CSS style for an enhanced visual experience.
-
-## OTA Updates Procedure
-
-To generate the firmware bin file and perform OTA updates, follow these steps:
-
-1. Make sure you have the Arduino IDE installed on your computer.
-
-2. Open the Arduino IDE and create a new sketch.
-
-3. Copy and paste the code you want to upload to the ESP8266.
-
-4. Connect the ESP8266 to your computer via USB.
-
-5. Select the appropriate board and COM port in the Arduino IDE
-
-
-6. Click on "Sketch" > "Export compiled Binary" to generate the bin file.
-
-7. Save the bin file to a location on your computer.
-
-8. In the web page interface, find the "OTA Update" button and click on it.
-
-9. Select the bin file you saved earlier and click on "Upload."
-
-10. The ESP8266 will start receiving the OTA update wirelessly.
-
-Note: Ensure that your ESP8266 is connected to the same network as the computer running the web page interface for OTA updates to work properly.
+Passwords are stored salted (chip-id salt) + SHA-256; the auth gate covers every
+mutating route; OTA upload requires admin. Plain HTTP only — use on a trusted
+LAN. Rotate the admin password after giving anyone access.
 
 ## License
 
-This code is released under the GPL-3.0 LICENCE 
-
-Please refer to the individual source files for any additional licenses or attributions.
-
-## Acknowledgments
-
-We acknowledge the contributions and inspiration from various open-source projects and the ESP8266 community.
-
-If you encounter any issues or have any questions, please feel free to open an issue in this repository. We appreciate your feedback and contributions to improving this codebase. And also for any feature request.
-
-Thank you and happy coding!
-Please contact me here in case of any queries
-bhavishyamadan@gmail.com
-
-
-
-
-
-
-
+GPL-3.0 — see `LICENSE`.
