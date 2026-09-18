@@ -1,4 +1,5 @@
 // NIST FIPS-180-4 vectors + million-'a' vector for our SHA-256.
+#include <cstdio>
 #include <string.h>
 #include <unity.h>
 #include "sha256.h"
