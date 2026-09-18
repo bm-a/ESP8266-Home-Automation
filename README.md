@@ -14,6 +14,8 @@ firmware update, Arduino relay controller with manual switches.
 ## Table of contents
 
 1. [Features — what it does and how](#1-features--what-it-does-and-how)
+   - [1.10 One-press updates from GitHub](#110-one-press-updates-from-github)
+   - [1.11 Recovery: press RESET 3 times](#111-recovery-press-reset-3-times)
 2. [What you need (parts list)](#2-what-you-need-parts-list)
 3. [Wiring — step by step](#3-wiring--step-by-step)
 4. [Installing the firmware (3 ways)](#4-installing-the-firmware-3-ways)
@@ -100,6 +102,28 @@ Reach the board at `esp-home.local` instead of hunting for its IP in the
 router page (works on most phones/desktops; falls back to the IP shown in the
 dashboard).
 
+### 1.10 One-press updates from GitHub
+
+When a new release is published on this repo's GitHub page, the board notices
+by itself: it checks once shortly after boot and logs `Update available: vX`.
+Open `/update` (admin), press **Check for updates**, and if one is newer than
+the running firmware an **Install** button appears. One press downloads the
+`.bin` straight from the GitHub release, flashes it, and reboots — no laptop,
+no USB, no file-picking. The classic manual `.bin` upload stays right below it
+for offline use. (How it works: HTTPS to the GitHub Releases API, version
+compare, streaming flash with verification. Details in `docs/SOURCES.md`.)
+
+### 1.11 Recovery: press RESET 3 times
+
+Stuck offline with the wrong WiFi password and no USB cable at hand? Press the
+board's **RESET button 3 times within ~20 seconds**. The board erases the
+stored WiFi credentials and opens the `ESP-Setup-XXXX` portal so you can enter
+the correct network — as easy as it sounds, no tools needed. Normal single
+resets and power cuts never trigger it (the counter lives in RTC memory, which
+forgets everything on power loss), and the board's own self-reboots are
+explicitly excluded, so it can't fire by accident. You'll find a
+`Triple-reset: WiFi erased` line in the log afterwards.
+
 ---
 
 ## 2. What you need (parts list)
@@ -179,7 +203,7 @@ esptool.py --port /dev/ttyUSB0 write_flash 0x00000 esp-home-v1.0.bin
 
 1. Install [PlatformIO](https://platformio.org/) (VS Code extension or `pip install platformio`).
 2. Clone this repo, open it, run `pio run -e esp12e -t upload`.
-3. Optional checks: `pio test -e native` (34 unit tests), `sh run_tests.sh` (tests + 30-day simulator).
+3. Optional checks: `pio test -e native` (46 unit tests), `sh run_tests.sh` (tests + 30-day simulator), `sh tools/check_ino.sh` (generated sketch compiles).
 
 ### Option C — Arduino IDE
 
@@ -233,7 +257,7 @@ To change networks later: hold **switch 1 for 8 seconds**, or Settings →
 | `/settings` → OTA password | admin | Password for ArduinoOTA + browser upload (applies after reboot) |
 | `/settings` → Open WiFi portal | admin | Reopens `ESP-Setup-XXXX` for 5 min |
 | `/settings` → Reboot | admin | Clean reboot (state is saved first) |
-| `/update` | admin | Browser firmware upload form |
+| `/update` | admin | One-press GitHub update + manual `.bin` upload |
 
 ---
 
@@ -254,6 +278,8 @@ Basic (`admin` or `user`). `user` may call state + relay endpoints only.
 | `POST /api/otapw` | admin | `password=…` (needs reboot) |
 | `POST /api/portal` | admin | Open WiFi portal |
 | `POST /api/restart` | admin | Reboot |
+| `GET /api/ghcheck` | admin | Check GitHub for newer release → `{"ok":true,"current":"1.01","tag":"v1.02","url":"…bin","newer":true}` |
+| `POST /api/ghupdate` | admin | `url=…` download + flash + reboot |
 
 Example (toggle relay 1 with curl):
 
@@ -283,7 +309,10 @@ are never auto-deleted by rotation (shown as `[no-time]`).
 
 ## 10. Firmware updates (OTA)
 
-**Browser:** `/update` (admin) → choose the new `.bin` → Upload. The board
+**Automatic (GitHub):** `/update` (admin) → Check for updates → Install.
+Needs internet once; the board does the rest and reboots itself.
+
+**Browser:** `/update` (admin) → choose a `.bin` → Upload. The board
 verifies, flashes, logs the result and reboots. Only signed-in admin sessions
 can start an upload; anything else gets `403`.
 
@@ -306,6 +335,8 @@ password from Settings. Changing the OTA password needs one reboot to apply.
 | Switch needs many presses | Mechanical bounce beyond 50 ms: increase `HA_DEBOUNCE_MS` in `src/config.h` |
 | Dashboard shows `[no-time]` | No internet for NTP; relays/switches unaffected; time fills in when online |
 | `esp-home.local` doesn't resolve | mDNS blocked by router/VPN: use the IP from the dashboard header or router list |
+| Board offline after WiFi password change | Press RESET 3× in 20 s → portal reopens, enter the new password |
+| WiFi router rebooted, board never comes back | Board re-associates by itself within ~60 s; check RSSI (below −80 dBm = too far) |
 | OTA upload fails | `.bin` built for the wrong board/flash size; reboot and retry |
 | Forgot admin password | Re-flash with USB (erases settings), or hold switch-1 portal trick won't help — USB reflash is the recovery path |
 
@@ -322,6 +353,14 @@ relays). The web/API design ports directly to ESP32 if you ever outgrow it.
 **How many loads?** Four, matching common 4-channel relay boards. The code
 supports up to 8 (`HA_CHANNELS`, tested to 8 in the unit suite) if you add
 wiring and free GPIOs.
+
+**How do updates work — do I need a laptop every time?** No. Publish a
+release on GitHub and the board installs it from `/update` in one press. USB
+is only needed for the very first flash (or if you forget the admin password).
+
+**How do I recover a board that lost WiFi?** Press RESET three times quickly —
+see §1.11. No USB, no reflash, settings and passwords are kept (only the WiFi
+credentials are erased).
 
 **Will rapid switching wear the flash?** Log writes are batched (every 25
 events or 60 s) and relay state is one byte — years of normal use.
@@ -352,11 +391,14 @@ the supply, and never expose terminals.
 
 ```
 src/logic/    hardware-independent core (RelayBank, SwitchBank, LogStore,
-              AuthStore, scheduler) — covered by host unit tests
-src/device/   ESP8266 drivers: portal, web UI, OTA, NTP, LittleFS storage
+              AuthStore, ResetWindow, GhOTA version/release parsing,
+              scheduler) — covered by host unit tests
+src/device/   ESP8266 drivers: portal, web UI, OTA (manual + GitHub),
+              NTP, LittleFS storage, RTC triple-reset recovery
 src/common/   shared SHA-256 (password hashing)
 src/main.cpp  wiring + loop
-test/         6 Unity suites, 34 assertions (run: pio test -e native)
+docs/         SOURCES.md (every reference), PRACTICES.md (coding standards)
+test/         8 Unity suites, 46 assertions (run: pio test -e native)
 tools/soak_sim.cpp      30-day simulator: switch storms, WiFi drops,
                         millis() wrap (run: sh run_tests.sh)
 tools/mirror_to_ino.py  regenerates arduino/ from src/ (CI-enforced fresh)

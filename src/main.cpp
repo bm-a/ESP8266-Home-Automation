@@ -8,10 +8,14 @@
 #include "config.h"
 #include "device/app_context.h"
 #include "device/fs_store.h"
+#include "device/gh_update.h"
 #include "device/ota_service.h"
+#include "device/reset_recovery.h"
 #include "device/time_sync.h"
 #include "device/web_ui.h"
 #include "device/wifi_portal.h"
+#include "logic/ghota.h"
+#include "logic/resetwin.h"
 #include "logic/scheduler.h"
 
 static const char* kDeviceName = DEVICE_NAME;
@@ -23,6 +27,7 @@ static ha::RelayBank s_relays;
 static ha::SwitchBank s_switches;
 static ha::LogStore s_log;
 static ha::AuthStore s_auth;
+static ha::ResetWindow s_resetWin;
 static AppContext s_ctx;
 
 static bool s_wifiUp = false;
@@ -39,6 +44,9 @@ static ha::Every s_flushTick(HA_LOG_FLUSH_INTERVAL_MS);
 static ha::Every s_pruneTick(86400000UL);
 static ha::Every s_keepaliveTick(HA_KEEPALIVE_INTERVAL_MS);
 static ha::Every s_wifiTick(5000);
+static uint32_t s_downSince = 0;
+static bool s_windowExpired = false;
+static bool s_ghBootChecked = false;
 
 static void persistAll() {
   uint8_t mask = 0;
@@ -64,7 +72,7 @@ static void applyRelayPin(int ch) {
 void setup() {
   Serial.begin(115200);
   Serial.println();
-  Serial.println("ESP-Home v1.0 booting");
+  Serial.println("ESP-Home " HA_VERSION " booting");
 
   if (!fsBegin(true)) Serial.println("FS mount failed!");
 
@@ -132,9 +140,29 @@ void setup() {
   s_ctx.wifiUp = &s_wifiUp;
   s_ctx.ntpOk = &s_ntpOk;
   s_ctx.otaPassword = &s_otaPassword;
+  s_ctx.fwVersion = HA_VERSION;
+
+  // Triple-reset recovery: N quick RESET presses -> wipe WiFi + portal.
+  // The count lives in RTC memory: resets preserve it, power loss clears it.
+  s_resetWin.configure(HA_RESET_COUNT, HA_RESET_WINDOW_MS);
+  s_resetWin.loadCount(resetRecoveryCount());
+  bool tripleReset = s_resetWin.noteBoot();
+  resetRecoverySave(s_resetWin.count());
 
   // Network: portal fallback, then time, OTA, mDNS, web.
-  s_wifiUp = wifiPortalBoot("ESP-Setup", HA_PORTAL_TIMEOUT_S);
+  if (tripleReset) {
+    addLog("Triple-reset: WiFi erased, opening portal");
+    Serial.println("Triple-reset recovery: erasing WiFi");
+    WiFi.disconnect(true);
+    wifiPortalOpen("ESP-Setup", HA_PORTAL_TIMEOUT_S);
+    wifiPortalPoll();
+    s_wifiUp = wifiIsUp();
+    resetRecoveryClear();
+    s_resetWin.clear();
+    s_windowExpired = true;
+  } else {
+    s_wifiUp = wifiPortalBoot("ESP-Setup", HA_PORTAL_TIMEOUT_S);
+  }
   Serial.print("WiFi: ");
   Serial.println(s_wifiUp ? wifiIp().c_str() : "offline");
   addLog(s_wifiUp ? "WiFi connected" : "WiFi offline; running standalone");
@@ -200,8 +228,22 @@ void loop() {
 
   uint32_t now = millis();
   if (s_wifiTick.due(now)) {
+    bool wasUp = s_wifiUp;
     wifiPortalPoll();
     s_wifiUp = wifiIsUp();
+    if (s_wifiUp) {
+      s_downSince = 0;
+    } else {
+      // Network-drop recovery: re-associate (rate-limited). No auto-reboot:
+      // a dead router doesn't need one, and reboots blink the relays.
+      if (wasUp) s_downSince = now;
+      if (WiFi.SSID().length() > 0 &&
+          (uint32_t)(now - s_downSince) >= HA_RECONNECT_AFTER_MS) {
+        s_downSince = now;
+        addLog("WiFi down 60s: reconnecting");
+        WiFi.reconnect();
+      }
+    }
   }
   if (s_ntpTick.due(now) && s_wifiUp) {
     timeSyncLoop();
@@ -222,6 +264,23 @@ void loop() {
 
   pollSwitches();
 
+  // Reset window expired: slow boots are not button mashing.
+  if (!s_windowExpired && now >= HA_RESET_WINDOW_MS) {
+    s_windowExpired = true;
+    resetRecoveryClear();
+    s_resetWin.clear();
+  }
+
+  // One-shot GitHub update check shortly after boot (then on demand).
+  if (!s_ghBootChecked && now >= 60000 && s_wifiUp) {
+    s_ghBootChecked = true;
+    std::string tag, url;
+    if (ghCheckLatest(tag, url) &&
+        ha::ghota::updateAvailable(HA_VERSION, tag)) {
+      addLog("Update available: " + tag + " (see /update)");
+    }
+  }
+
   if (s_portalRequested) {
     s_portalRequested = false;
     addLog("Opening config portal");
@@ -230,6 +289,7 @@ void loop() {
   }
   if (s_rebootRequested) {
     persistAll();
+    resetRecoveryDisarm();  // intentional reboot, not a button press
     delay(300);
     ESP.restart();
   }

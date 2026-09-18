@@ -28,4 +28,5 @@ struct AppContext {
   bool* wifiUp = nullptr;
   bool* ntpOk = nullptr;
   std::string* otaPassword = nullptr;  // ArduinoOTA/HTTP-upload password
+  const char* fwVersion = nullptr;     // HA_VERSION, shown on /update
 };

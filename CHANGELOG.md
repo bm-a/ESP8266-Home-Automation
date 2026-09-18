@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.01 (2026-09-19)
+- **Triple-reset recovery:** press the RESET button 3× within 20 s to erase
+  WiFi credentials and reopen the config portal. Count in RTC memory (resets
+  keep it, power loss clears it); self-reboots disarmed so they never
+  miscount. New `ResetWindow` logic + 5 unit tests.
+- **Network-drop hardening:** rate-limited `WiFi.reconnect()` after 60 s down
+  (no auto-reboot — reboots blink the relays); transition-tracked, logged.
+- **One-press GitHub OTA:** `/update` checks this repo's latest release,
+  shows an Install button when newer, downloads + flashes the `.bin` over
+  HTTPS with verification. Boot-time check logs availability. New `ghota`
+  logic (version compare + release-JSON scan) + 7 unit tests; manual upload
+  and ArduinoOTA unchanged.
+- **Docs:** `docs/SOURCES.md` (every reference behind the design) and
+  `docs/PRACTICES.md` (applied + recommended coding practices).
+- Firmware grows to ~546 KB flash (52%), RAM unchanged at 48%.
+
 ## v1.0 (2026-09-19) — first release (full rewrite of the v3 sketch)
 - PlatformIO project: modular `src/` (logic / device / common) + Unity tests
   (34 assertions) + 30-day soak sim + CI.

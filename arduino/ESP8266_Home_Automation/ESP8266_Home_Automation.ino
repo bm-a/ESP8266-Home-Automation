@@ -21,10 +21,13 @@
 #include <LittleFS.h>
 #include <WiFiUdp.h>
 
-// Forward declaration: the full definition is concatenated below
-// (src/device/app_context.h). Needed because the IDE hoists function
-// prototypes above the point where the struct is defined.
+// Forward declarations: full definitions are concatenated below.
+// Needed because the IDE hoists function prototypes above the point where
+// these structs are defined. RULE for contributors: free functions in device
+// code must not use custom types in their signatures unless the type is
+// forward-declared here (see docs/PRACTICES.md).
 struct AppContext;
+struct RtcSlot;
 // ===== src/common/sha256.h =====
 // Compact public-domain SHA-256 (Brad Conte style, rewritten here).
 // Used for salted password hashing. Verified against NIST vectors in tests.
@@ -553,6 +556,164 @@ bool AuthStore::load(const std::string& data) {
 }
 
 }  // namespace ha
+// ===== src/logic/ghota.h =====
+// GitHub-release OTA helpers (hardware-independent, host-tested).
+//
+// Parses the (already downloaded) GitHub "latest release" JSON for the tag
+// name and the first .bin asset URL, and compares dotted version numbers.
+// The device layer only fetches bytes; all decisions live here.
+#include <string>
+
+namespace ha {
+namespace ghota {
+
+// Extract tag_name and first browser_download_url ending in ".bin".
+// Returns true if at least the tag was found (bin URL may stay empty).
+bool parseLatest(const std::string& json, std::string& tagOut,
+                 std::string& binUrlOut);
+
+// Compare dotted versions ("1.01" vs "1.0"): -1 / 0 / +1.
+// Leading 'v'/'V' and surrounding whitespace are ignored; non-numeric
+// suffixes ("-beta") make that component compare lower.
+int compareVersions(const std::string& a, const std::string& b);
+
+// True if `latest` is newer than `current`.
+inline bool updateAvailable(const std::string& current,
+                            const std::string& latest) {
+  if (latest.empty()) return false;
+  return compareVersions(latest, current) > 0;
+}
+
+}  // namespace ghota
+}  // namespace ha
+// ===== src/logic/ghota.cpp =====
+#include <cctype>
+#include <vector>
+
+namespace ha {
+namespace ghota {
+
+namespace {
+std::string trim(const std::string& s) {
+  size_t a = 0;
+  while (a < s.size() && isspace((unsigned char)s[a])) a++;
+  size_t b = s.size();
+  while (b > a && isspace((unsigned char)s[b - 1])) b--;
+  std::string t = s.substr(a, b - a);
+  if (!t.empty() && (t[0] == 'v' || t[0] == 'V')) t = t.substr(1);
+  return t;
+}
+
+// Find "key" : "value" with optional whitespace. Returns false if absent.
+bool jsonString(const std::string& json, const std::string& key,
+                std::string& out, size_t from = 0) {
+  std::string q = "\"" + key + "\"";
+  size_t k = json.find(q, from);
+  if (k == std::string::npos) return false;
+  size_t c = json.find(':', k + q.size());
+  if (c == std::string::npos) return false;
+  size_t q1 = json.find('"', c + 1);
+  if (q1 == std::string::npos) return false;
+  size_t q2 = json.find('"', q1 + 1);
+  if (q2 == std::string::npos) return false;
+  out = json.substr(q1 + 1, q2 - q1 - 1);
+  return true;
+}
+}  // namespace
+
+bool parseLatest(const std::string& json, std::string& tagOut,
+                 std::string& binUrlOut) {
+  tagOut.clear();
+  binUrlOut.clear();
+  if (!jsonString(json, "tag_name", tagOut)) return false;
+  // First asset whose download URL ends in .bin (query strings stripped).
+  size_t from = 0;
+  std::string url;
+  while (jsonString(json, "browser_download_url", url, from)) {
+    size_t end = url.find_first_of("?#");
+    std::string path = url.substr(0, end);
+    if (path.size() >= 4 &&
+        path.compare(path.size() - 4, 4, ".bin") == 0) {
+      binUrlOut = url;
+      break;
+    }
+    from = json.find(url, from) + url.size();
+    if (from == std::string::npos) break;
+  }
+  return true;
+}
+
+int compareVersions(const std::string& a, const std::string& b) {
+  std::string ta = trim(a), tb = trim(b);
+  size_t ia = 0, ib = 0;
+  while (ia < ta.size() || ib < tb.size()) {
+    // Parse one numeric component from each side.
+    long na = 0, nb = 0;
+    bool aPre = false, bPre = false;
+    while (ia < ta.size() && ta[ia] != '.') {
+      char c = ta[ia++];
+      if (isdigit((unsigned char)c))
+        na = na * 10 + (c - '0');
+      else if (c == '-' || !(na == 0 && (c == ' ')))
+        aPre = true;  // pre-release suffix devalues the component
+    }
+    while (ib < tb.size() && tb[ib] != '.') {
+      char c = tb[ib++];
+      if (isdigit((unsigned char)c))
+        nb = nb * 10 + (c - '0');
+      else
+        bPre = true;
+    }
+    if (ia < ta.size() && ta[ia] == '.') ia++;
+    if (ib < tb.size() && tb[ib] == '.') ib++;
+    if (na != nb) return na < nb ? -1 : 1;
+    if (aPre != bPre) return aPre ? -1 : 1;  // release beats pre-release
+  }
+  return 0;
+}
+
+}  // namespace ghota
+}  // namespace ha
+// ===== src/logic/resetwin.h =====
+// Multi-reset recovery counter ("press RESET 3 times").
+// Counts consecutive boots inside a time window; the count itself is persisted
+// by the device layer (ESP8266 RTC memory survives resets, not power loss).
+// Pure logic so host tests can drive it.
+
+namespace ha {
+
+class ResetWindow {
+ public:
+  ResetWindow();
+
+  void configure(int threshold, unsigned long window_ms);
+  void loadCount(int n) { count_ = n < 0 ? 0 : n; }
+  int count() const { return count_; }
+
+  // Call once per boot. Returns true when the threshold is reached.
+  bool noteBoot() {
+    count_++;
+    return count_ >= threshold_;
+  }
+
+  void clear() { count_ = 0; }
+
+ private:
+  int threshold_ = 3;
+  unsigned long window_ms_ = 20000;
+  int count_ = 0;
+};
+
+inline ResetWindow::ResetWindow() = default;
+
+inline void ResetWindow::configure(int threshold, unsigned long window_ms) {
+  if (threshold < 2) threshold = 2;
+  threshold_ = threshold;
+  window_ms_ = window_ms;
+  count_ = 0;
+}
+
+}  // namespace ha
 // ===== src/logic/scheduler.h =====
 // Rollover-safe periodic timer (unsigned subtraction handles millis() wrap).
 #include <cstdint>
@@ -596,6 +757,16 @@ class Every {
 // GPIO0/2 use INPUT_PULLUP + button-to-GND (same as the FLASH button: safe).
 
 #define HA_CHANNELS 4
+
+#define HA_VERSION "1.01"
+
+// Triple-reset recovery: this many RESET presses inside the window below
+// wipes WiFi credentials and opens the config portal.
+#define HA_RESET_COUNT 3
+#define HA_RESET_WINDOW_MS 20000UL
+
+// Re-attempt WiFi association after this long without a connection.
+#define HA_RECONNECT_AFTER_MS 60000UL
 
 #define HA_RELAY_PINS \
   { 5, 4, 12, 13 }
@@ -647,6 +818,7 @@ struct AppContext {
   bool* wifiUp = nullptr;
   bool* ntpOk = nullptr;
   std::string* otaPassword = nullptr;  // ArduinoOTA/HTTP-upload password
+  const char* fwVersion = nullptr;     // HA_VERSION, shown on /update
 };
 // ===== src/device/fs_store.h =====
 // LittleFS persistence helpers (device only).
@@ -682,6 +854,66 @@ bool fsWriteFile(const char* path, const std::string& data) {
   f.close();
   return n == data.size();
 }
+// ===== src/device/reset_recovery.h =====
+// Triple-reset recovery backed by ESP8266 RTC user memory.
+//
+// Concept: khoih-prog's ESP_DoubleResetDetector (count boots inside a window).
+// Mechanism: ESP8266 Arduino core `ESP.rtcUserMemoryRead/Write` — RTC memory
+// survives resets (incl. the RESET button and ESP.restart) but NOT power loss,
+// which is exactly the semantics a "press reset N times" detector needs.
+// Uses words 64..66, clear of the SDK-reserved low region.
+//
+// Rule: call resetRecoveryBoot() early in setup(). Before ANY intentional
+// ESP.restart(), call resetRecoveryDisarm() so self-reboots are never
+// mistaken for button presses.
+
+// Returns the persisted consecutive-boot count (0 on power-up/first boot).
+int resetRecoveryCount();
+// Persist a count (device mirrors ha::ResetWindow here).
+void resetRecoverySave(int count);
+// Clear the count: call after the window expires (uptime) or after recovery.
+void resetRecoveryClear();
+// Mark the next reboot as intentional (not a button press).
+void resetRecoveryDisarm();
+// ===== src/device/reset_recovery.cpp =====
+#include <ESP8266WiFi.h>
+
+static const uint32_t kMagic = 0x48415243;  // "HARC"
+static const uint32_t kRtcOffset = 64;      // words; above SDK-reserved area
+
+struct RtcSlot {
+  uint32_t magic;
+  uint32_t count;
+  uint32_t spare;
+};
+
+static bool rtcRead(RtcSlot& s) {
+  if (!ESP.rtcUserMemoryRead(kRtcOffset, (uint32_t*)&s, sizeof(s) / 4))
+    return false;
+  return s.magic == kMagic;
+}
+
+static void rtcWrite(const RtcSlot& s) {
+  ESP.rtcUserMemoryWrite(kRtcOffset, (uint32_t*)&s, sizeof(s) / 4);
+}
+
+int resetRecoveryCount() {
+  RtcSlot s{0, 0, 0};
+  if (!rtcRead(s)) return 0;
+  return (int)s.count;
+}
+
+void resetRecoverySave(int count) {
+  RtcSlot s{kMagic, (uint32_t)(count < 0 ? 0 : count), 0};
+  rtcWrite(s);
+}
+
+void resetRecoveryClear() {
+  RtcSlot s{0, 0, 0};  // bad magic == "no history"
+  rtcWrite(s);
+}
+
+void resetRecoveryDisarm() { resetRecoveryClear(); }
 // ===== src/device/time_sync.h =====
 // NTP time sync (device only). TimeLib holds wall-clock for formatting.
 #include <cstdint>
@@ -814,6 +1046,104 @@ bool wifiIsUp() { return s_up; }
 std::string wifiIp() {
   if (!s_up) return std::string("0.0.0.0");
   return std::string(WiFi.localIP().toString().c_str());
+}
+// ===== src/device/gh_update.h =====
+// GitHub-release OTA: "press Update, get the latest GitHub release".
+//
+// Flow: HTTPS GET api.github.com → ha::ghota::parseLatest finds tag + .bin
+// asset → HTTPS download (follows github.com → objects.* redirect) →
+// flash via the Updater class (same engine as the Arduino OTA core).
+// TLS: BearSSL with setInsecure() — see SOURCES.md; acceptable on a trusted
+// LAN because the flashed image is only accepted if the Update checksum
+// closes cleanly, and releases come from the owner's repo. (ESP8266 Arduino
+// core BearSSL docs; GitHub REST "Get the latest release" API.)
+#include <string>
+
+#define HA_GH_OWNER "bm-a"
+#define HA_GH_REPO "ESP8266-Home-Automation"
+
+// Fetch latest tag + .bin URL. Empty tag = check failed (offline/API error).
+// Logs nothing; caller decides. `bodyOut` receives raw JSON when non-null.
+bool ghCheckLatest(std::string& tagOut, std::string& binUrlOut,
+                   std::string* bodyOut = nullptr);
+
+// Download `binUrl` and flash it. Returns true on verified success.
+// Caller MUST reboot afterwards. Progress goes to `logFn` (may be null).
+bool ghDownloadAndFlash(const std::string& binUrl,
+                        void (*logFn)(const std::string&) = nullptr);
+// ===== src/device/gh_update.cpp =====
+#include <ESP8266HTTPClient.h>
+#include <Updater.h>
+#include <WiFiClientSecure.h>
+
+static const char* kApiHost = "api.github.com";
+static const int kApiPort = 443;
+
+static void applySecure(WiFiClientSecure& c) {
+  c.setInsecure();
+  c.setTimeout(15000);
+}
+
+bool ghCheckLatest(std::string& tagOut, std::string& binUrlOut,
+                   std::string* bodyOut) {
+  tagOut.clear();
+  binUrlOut.clear();
+  WiFiClientSecure client;
+  applySecure(client);
+  HTTPClient http;
+  std::string path = std::string("/repos/") + HA_GH_OWNER + "/" + HA_GH_REPO +
+                     "/releases/latest";
+  if (!http.begin(client, kApiHost, kApiPort, path.c_str(), true)) return false;
+  http.setUserAgent("esp-home-ota");
+  http.setTimeout(15000);
+  http.addHeader("Accept", "application/vnd.github+json");
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  std::string raw(body.c_str(), body.length());
+  if (bodyOut) *bodyOut = raw;
+  return ha::ghota::parseLatest(raw, tagOut, binUrlOut);
+}
+
+bool ghDownloadAndFlash(const std::string& binUrl,
+                        void (*logFn)(const std::string&)) {
+  if (binUrl.empty()) return false;
+  WiFiClientSecure client;
+  applySecure(client);
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setUserAgent("esp-home-ota");
+  http.setTimeout(20000);
+  if (!http.begin(client, binUrl.c_str())) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+  int total = http.getSize();
+  if (total <= 0) {
+    http.end();
+    return false;
+  }
+  uint32_t maxSketch = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+  if (!Update.begin(maxSketch)) {
+    http.end();
+    return false;
+  }
+  size_t written = Update.writeStream(http.getStream());
+  bool ok = (written == (size_t)total) && Update.end(true);
+  if (logFn) {
+    char msg[96];
+    snprintf(msg, sizeof(msg), "GitHub OTA %s (%u bytes)",
+             ok ? "applied" : "FAILED", (unsigned)written);
+    logFn(msg);
+  }
+  http.end();
+  return ok && !Update.hasError();
 }
 // ===== src/device/ota_service.h =====
 // OTA: ArduinoOTA (IDE uploads) + authenticated HTTP upload (device only).
@@ -1162,11 +1492,27 @@ static void handleUpdatePage() {
   if (setupGate()) return;
   if (needAuth(R_ADMIN)) return;
   String body =
-      "<div class='card'><p>Upload a compiled .bin (same build). "
+      "<div class='card'><h3>Automatic update (GitHub release)</h3>"
+      "<p>Running: <b>" +
+      String(s_web->fwVersion) +
+      "</b> <span id='g'>…checking…</span></p>"
+      "<button onclick='ghcheck()'>Check for updates</button> "
+      "<span id='gi'></span><p id='gm'></p></div>"
+      "<div class='card'><h3>Manual upload</h3><p>Upload a compiled .bin. "
       "Device reboots automatically.</p>"
       "<form method='POST' action='/update' enctype='multipart/form-data'>"
       "<input type='file' name='firmware'><button type='submit'>Upload</button>"
-      "</form></div>";
+      "</form></div>"
+      "<script>async function ghcheck(){document.getElementById('g').innerText='checking…';"
+      "const r=await fetch('/api/ghcheck');const j=await r.json();"
+      "document.getElementById('g').innerText='latest: '+(j.tag||'check failed');"
+      "document.getElementById('gi').innerHTML=j.newer?'<button onclick=\"ghup(\\''+j.url+'\\')\">Install '+j.tag+'</button>':'';}"
+      "async function ghup(u){if(!confirm('Flash '+u+'?'))return;"
+      "document.getElementById('gm').innerText='downloading… (up to a minute)';"
+      "const f=new URLSearchParams({url:u});"
+      "const r=await fetch('/api/ghupdate',{method:'POST',body:f});"
+      "document.getElementById('gm').innerText=await r.text();}"
+      "ghcheck();</script>";
   page("Firmware update", body);
 }
 
@@ -1197,7 +1543,43 @@ static void handleUpdateDone() {
   }
   s_server.send(200, "text/plain", "Update OK - rebooting…");
   delay(500);
-  ESP.restart();
+  s_web->requestReboot();  // via main: persists + disarms reset detector
+}
+
+static void handleApiGhCheck() {
+  if (setupGate()) return;
+  if (needAuth(R_ADMIN)) return;
+  std::string tag, url;
+  bool ok = ghCheckLatest(tag, url);
+  String j = "{\"ok\":";
+  j += ok ? "true" : "false";
+  j += ",\"current\":\"" + String(s_web->fwVersion) + "\"";
+  j += ",\"tag\":\"" + String(tag.c_str()) + "\"";
+  j += ",\"url\":\"" + String(url.c_str()) + "\"";
+  j += ",\"newer\":";
+  j += (ok && ha::ghota::updateAvailable(s_web->fwVersion, tag)) ? "true"
+                                                                 : "false";
+  j += "}";
+  s_server.send(200, "application/json", j);
+}
+
+static void handleApiGhUpdate() {
+  if (setupGate()) return;
+  if (needAuth(R_ADMIN)) return;
+  std::string url = s_server.arg("url").c_str();
+  if (url.empty()) {
+    s_server.send(400, "text/plain", "Missing url");
+    return;
+  }
+  auto logFn = [](const std::string& m) { s_web->addLog(m); };
+  s_server.sendHeader("Connection", "close");
+  if (!ghDownloadAndFlash(url, logFn)) {
+    s_server.send(500, "text/plain", "Download/flash failed - see log");
+    return;
+  }
+  s_server.send(200, "text/plain", "Update OK - rebooting…");
+  delay(500);
+  s_web->requestReboot();
 }
 
 static void handleNotFound() {
@@ -1227,6 +1609,8 @@ void webBegin(AppContext* ctx) {
   s_server.on("/api/portal", HTTP_POST, handlePortal);
   s_server.on("/api/restart", HTTP_POST, handleRestart);
   s_server.on("/update", HTTP_GET, handleUpdatePage);
+  s_server.on("/api/ghcheck", HTTP_GET, handleApiGhCheck);
+  s_server.on("/api/ghupdate", HTTP_POST, handleApiGhUpdate);
   s_server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   s_server.onNotFound(handleNotFound);
   s_server.begin();
@@ -1250,6 +1634,7 @@ static ha::RelayBank s_relays;
 static ha::SwitchBank s_switches;
 static ha::LogStore s_log;
 static ha::AuthStore s_auth;
+static ha::ResetWindow s_resetWin;
 static AppContext s_ctx;
 
 static bool s_wifiUp = false;
@@ -1266,6 +1651,9 @@ static ha::Every s_flushTick(HA_LOG_FLUSH_INTERVAL_MS);
 static ha::Every s_pruneTick(86400000UL);
 static ha::Every s_keepaliveTick(HA_KEEPALIVE_INTERVAL_MS);
 static ha::Every s_wifiTick(5000);
+static uint32_t s_downSince = 0;
+static bool s_windowExpired = false;
+static bool s_ghBootChecked = false;
 
 static void persistAll() {
   uint8_t mask = 0;
@@ -1291,7 +1679,7 @@ static void applyRelayPin(int ch) {
 void setup() {
   Serial.begin(115200);
   Serial.println();
-  Serial.println("ESP-Home v1.0 booting");
+  Serial.println("ESP-Home " HA_VERSION " booting");
 
   if (!fsBegin(true)) Serial.println("FS mount failed!");
 
@@ -1359,9 +1747,29 @@ void setup() {
   s_ctx.wifiUp = &s_wifiUp;
   s_ctx.ntpOk = &s_ntpOk;
   s_ctx.otaPassword = &s_otaPassword;
+  s_ctx.fwVersion = HA_VERSION;
+
+  // Triple-reset recovery: N quick RESET presses -> wipe WiFi + portal.
+  // The count lives in RTC memory: resets preserve it, power loss clears it.
+  s_resetWin.configure(HA_RESET_COUNT, HA_RESET_WINDOW_MS);
+  s_resetWin.loadCount(resetRecoveryCount());
+  bool tripleReset = s_resetWin.noteBoot();
+  resetRecoverySave(s_resetWin.count());
 
   // Network: portal fallback, then time, OTA, mDNS, web.
-  s_wifiUp = wifiPortalBoot("ESP-Setup", HA_PORTAL_TIMEOUT_S);
+  if (tripleReset) {
+    addLog("Triple-reset: WiFi erased, opening portal");
+    Serial.println("Triple-reset recovery: erasing WiFi");
+    WiFi.disconnect(true);
+    wifiPortalOpen("ESP-Setup", HA_PORTAL_TIMEOUT_S);
+    wifiPortalPoll();
+    s_wifiUp = wifiIsUp();
+    resetRecoveryClear();
+    s_resetWin.clear();
+    s_windowExpired = true;
+  } else {
+    s_wifiUp = wifiPortalBoot("ESP-Setup", HA_PORTAL_TIMEOUT_S);
+  }
   Serial.print("WiFi: ");
   Serial.println(s_wifiUp ? wifiIp().c_str() : "offline");
   addLog(s_wifiUp ? "WiFi connected" : "WiFi offline; running standalone");
@@ -1427,8 +1835,22 @@ void loop() {
 
   uint32_t now = millis();
   if (s_wifiTick.due(now)) {
+    bool wasUp = s_wifiUp;
     wifiPortalPoll();
     s_wifiUp = wifiIsUp();
+    if (s_wifiUp) {
+      s_downSince = 0;
+    } else {
+      // Network-drop recovery: re-associate (rate-limited). No auto-reboot:
+      // a dead router doesn't need one, and reboots blink the relays.
+      if (wasUp) s_downSince = now;
+      if (WiFi.SSID().length() > 0 &&
+          (uint32_t)(now - s_downSince) >= HA_RECONNECT_AFTER_MS) {
+        s_downSince = now;
+        addLog("WiFi down 60s: reconnecting");
+        WiFi.reconnect();
+      }
+    }
   }
   if (s_ntpTick.due(now) && s_wifiUp) {
     timeSyncLoop();
@@ -1449,6 +1871,23 @@ void loop() {
 
   pollSwitches();
 
+  // Reset window expired: slow boots are not button mashing.
+  if (!s_windowExpired && now >= HA_RESET_WINDOW_MS) {
+    s_windowExpired = true;
+    resetRecoveryClear();
+    s_resetWin.clear();
+  }
+
+  // One-shot GitHub update check shortly after boot (then on demand).
+  if (!s_ghBootChecked && now >= 60000 && s_wifiUp) {
+    s_ghBootChecked = true;
+    std::string tag, url;
+    if (ghCheckLatest(tag, url) &&
+        ha::ghota::updateAvailable(HA_VERSION, tag)) {
+      addLog("Update available: " + tag + " (see /update)");
+    }
+  }
+
   if (s_portalRequested) {
     s_portalRequested = false;
     addLog("Opening config portal");
@@ -1457,6 +1896,7 @@ void loop() {
   }
   if (s_rebootRequested) {
     persistAll();
+    resetRecoveryDisarm();  // intentional reboot, not a button press
     delay(300);
     ESP.restart();
   }

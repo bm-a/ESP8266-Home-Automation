@@ -3,6 +3,8 @@
 #include <Updater.h>
 #include <Uri.h>
 #include "../config.h"
+#include "../logic/ghota.h"
+#include "gh_update.h"
 #include "wifi_portal.h"
 
 static ESP8266WebServer s_server(80);
@@ -315,11 +317,27 @@ static void handleUpdatePage() {
   if (setupGate()) return;
   if (needAuth(R_ADMIN)) return;
   String body =
-      "<div class='card'><p>Upload a compiled .bin (same build). "
+      "<div class='card'><h3>Automatic update (GitHub release)</h3>"
+      "<p>Running: <b>" +
+      String(s_web->fwVersion) +
+      "</b> <span id='g'>…checking…</span></p>"
+      "<button onclick='ghcheck()'>Check for updates</button> "
+      "<span id='gi'></span><p id='gm'></p></div>"
+      "<div class='card'><h3>Manual upload</h3><p>Upload a compiled .bin. "
       "Device reboots automatically.</p>"
       "<form method='POST' action='/update' enctype='multipart/form-data'>"
       "<input type='file' name='firmware'><button type='submit'>Upload</button>"
-      "</form></div>";
+      "</form></div>"
+      "<script>async function ghcheck(){document.getElementById('g').innerText='checking…';"
+      "const r=await fetch('/api/ghcheck');const j=await r.json();"
+      "document.getElementById('g').innerText='latest: '+(j.tag||'check failed');"
+      "document.getElementById('gi').innerHTML=j.newer?'<button onclick=\"ghup(\\''+j.url+'\\')\">Install '+j.tag+'</button>':'';}"
+      "async function ghup(u){if(!confirm('Flash '+u+'?'))return;"
+      "document.getElementById('gm').innerText='downloading… (up to a minute)';"
+      "const f=new URLSearchParams({url:u});"
+      "const r=await fetch('/api/ghupdate',{method:'POST',body:f});"
+      "document.getElementById('gm').innerText=await r.text();}"
+      "ghcheck();</script>";
   page("Firmware update", body);
 }
 
@@ -350,7 +368,43 @@ static void handleUpdateDone() {
   }
   s_server.send(200, "text/plain", "Update OK - rebooting…");
   delay(500);
-  ESP.restart();
+  s_web->requestReboot();  // via main: persists + disarms reset detector
+}
+
+static void handleApiGhCheck() {
+  if (setupGate()) return;
+  if (needAuth(R_ADMIN)) return;
+  std::string tag, url;
+  bool ok = ghCheckLatest(tag, url);
+  String j = "{\"ok\":";
+  j += ok ? "true" : "false";
+  j += ",\"current\":\"" + String(s_web->fwVersion) + "\"";
+  j += ",\"tag\":\"" + String(tag.c_str()) + "\"";
+  j += ",\"url\":\"" + String(url.c_str()) + "\"";
+  j += ",\"newer\":";
+  j += (ok && ha::ghota::updateAvailable(s_web->fwVersion, tag)) ? "true"
+                                                                 : "false";
+  j += "}";
+  s_server.send(200, "application/json", j);
+}
+
+static void handleApiGhUpdate() {
+  if (setupGate()) return;
+  if (needAuth(R_ADMIN)) return;
+  std::string url = s_server.arg("url").c_str();
+  if (url.empty()) {
+    s_server.send(400, "text/plain", "Missing url");
+    return;
+  }
+  auto logFn = [](const std::string& m) { s_web->addLog(m); };
+  s_server.sendHeader("Connection", "close");
+  if (!ghDownloadAndFlash(url, logFn)) {
+    s_server.send(500, "text/plain", "Download/flash failed - see log");
+    return;
+  }
+  s_server.send(200, "text/plain", "Update OK - rebooting…");
+  delay(500);
+  s_web->requestReboot();
 }
 
 static void handleNotFound() {
@@ -380,6 +434,8 @@ void webBegin(AppContext* ctx) {
   s_server.on("/api/portal", HTTP_POST, handlePortal);
   s_server.on("/api/restart", HTTP_POST, handleRestart);
   s_server.on("/update", HTTP_GET, handleUpdatePage);
+  s_server.on("/api/ghcheck", HTTP_GET, handleApiGhCheck);
+  s_server.on("/api/ghupdate", HTTP_POST, handleApiGhUpdate);
   s_server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   s_server.onNotFound(handleNotFound);
   s_server.begin();

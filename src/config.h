@@ -10,6 +10,16 @@
 
 #define HA_CHANNELS 4
 
+#define HA_VERSION "1.01"
+
+// Triple-reset recovery: this many RESET presses inside the window below
+// wipes WiFi credentials and opens the config portal.
+#define HA_RESET_COUNT 3
+#define HA_RESET_WINDOW_MS 20000UL
+
+// Re-attempt WiFi association after this long without a connection.
+#define HA_RECONNECT_AFTER_MS 60000UL
+
 #define HA_RELAY_PINS \
   { 5, 4, 12, 13 }
 #define HA_SWITCH_PINS \

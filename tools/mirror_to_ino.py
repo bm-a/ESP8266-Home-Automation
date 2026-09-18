@@ -23,15 +23,22 @@ ORDER = [
     "src/logic/logstore.cpp",
     "src/logic/auth.h",
     "src/logic/auth.cpp",
+    "src/logic/ghota.h",
+    "src/logic/ghota.cpp",
+    "src/logic/resetwin.h",
     "src/logic/scheduler.h",
     "src/config.h",
     "src/device/app_context.h",
     "src/device/fs_store.h",
     "src/device/fs_store.cpp",
+    "src/device/reset_recovery.h",
+    "src/device/reset_recovery.cpp",
     "src/device/time_sync.h",
     "src/device/time_sync.cpp",
     "src/device/wifi_portal.h",
     "src/device/wifi_portal.cpp",
+    "src/device/gh_update.h",
+    "src/device/gh_update.cpp",
     "src/device/ota_service.h",
     "src/device/ota_service.cpp",
     "src/device/web_ui.h",
@@ -62,10 +69,13 @@ HEADER = """// ESP8266 Home Automation v1.0 — Arduino IDE sketch (GENERATED FI
 #include <LittleFS.h>
 #include <WiFiUdp.h>
 
-// Forward declaration: the full definition is concatenated below
-// (src/device/app_context.h). Needed because the IDE hoists function
-// prototypes above the point where the struct is defined.
+// Forward declarations: full definitions are concatenated below.
+// Needed because the IDE hoists function prototypes above the point where
+// these structs are defined. RULE for contributors: free functions in device
+// code must not use custom types in their signatures unless the type is
+// forward-declared here (see docs/PRACTICES.md).
 struct AppContext;
+struct RtcSlot;
 
 """
 
