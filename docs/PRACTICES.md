@@ -33,6 +33,17 @@
     generated file actually compiles.
 12. **`.gitignore` the build cache.** `.pio/` is hundreds of MB and
     machine-specific — it once got committed here by accident.
+13. **Sessions, not per-request secrets.** Basic auth replays the password on
+    every call and can't be revoked short of changing it. Opaque tokens with
+    expiry + explicit logout are barely more code.
+14. **Rate-limit authentication.** Any login endpoint without a lockout is a
+    password-guessing oracle. Count per IP, sliding window, temporary lock,
+    log with source.
+15. **Allowlist outbound fetch targets.** A device that downloads URLs must
+    never fetch attacker-chosen hosts (SSRF) — especially one that then
+    flashes what it fetched.
+16. **Send secure headers by default.** One wrapper (`sendSecure`) around
+    every response beats remembering per handler.
 
 ## Practices worth knowing (not yet applied)
 

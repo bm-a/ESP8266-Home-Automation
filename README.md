@@ -16,6 +16,7 @@ firmware update, Arduino relay controller with manual switches.
 1. [Features — what it does and how](#1-features--what-it-does-and-how)
    - [1.10 One-press updates from GitHub](#110-one-press-updates-from-github)
    - [1.11 Recovery: press RESET 3 times](#111-recovery-press-reset-3-times)
+   - [1.12 Always-on security hardening](#112-always-on-security-hardening)
 2. [What you need (parts list)](#2-what-you-need-parts-list)
 3. [Wiring — step by step](#3-wiring--step-by-step)
 4. [Installing the firmware (3 ways)](#4-installing-the-firmware-3-ways)
@@ -67,8 +68,10 @@ network.
 - **admin** — full access: relays, logs, passwords, WiFi portal, reboot, firmware updates.
 - **user** (optional, disabled by default) — can only see state and toggle relays. Ideal for family members or tenants.
 
-There are **no factory default passwords**. On first boot the site forces you
-to create the admin password (minimum 8 characters) before anything else works.
+Sign in once on the `/login` page; the board keeps you signed in for 30
+minutes of activity via a secure session cookie. There are **no factory
+default passwords**. On first boot the site forces you to create the admin
+password (minimum 8 characters) before anything else works.
 
 ### 1.5 Event log with real timestamps
 
@@ -203,7 +206,7 @@ esptool.py --port /dev/ttyUSB0 write_flash 0x00000 esp-home-v1.0.bin
 
 1. Install [PlatformIO](https://platformio.org/) (VS Code extension or `pip install platformio`).
 2. Clone this repo, open it, run `pio run -e esp12e -t upload`.
-3. Optional checks: `pio test -e native` (46 unit tests), `sh run_tests.sh` (tests + 30-day simulator), `sh tools/check_ino.sh` (generated sketch compiles).
+3. Optional checks: `pio test -e native` (59 unit tests), `sh run_tests.sh` (tests + 30-day simulator), `sh tools/check_ino.sh` (generated sketch compiles).
 
 ### Option C — Arduino IDE
 
@@ -235,7 +238,8 @@ To change networks later: hold **switch 1 for 8 seconds**, or Settings →
 
 ## 6. Daily use
 
-- **Toggle a load:** open the dashboard, press Turn ON / Turn OFF. Or press the
+- **Toggle a load:** open the dashboard (log in first — sessions last 30 min
+  idle), then press Turn ON / Turn OFF. Or press the
   physical switch — both stay in sync because there is one relay state.
 - **Check state at a glance:** the dashboard polls every 2 s; the header shows
   time, IP and WiFi signal (RSSI in dBm; above −70 is healthy).
@@ -263,11 +267,16 @@ To change networks later: hold **switch 1 for 8 seconds**, or Settings →
 
 ## 8. HTTP API reference
 
-Base: `http://<board-ip>` (or `http://esp-home.local`). Authentication: HTTP
-Basic (`admin` or `user`). `user` may call state + relay endpoints only.
+Base: `http://<board-ip>` (or `http://esp-home.local`). Authentication: sign
+in once (`POST /api/login`), then send the `HA_SESSION` cookie with each
+request (browsers do this automatically; curl: `--cookie-jar/--cookie`).
+`user` sessions may call state + relay + logout only. Sessions expire after
+30 minutes idle.
 
 | Method + path | Auth | Description |
 |---|---|---|
+| `POST /api/login` | — | Form `user=admin\|user` + `password=…` → sets session cookie, `{"ok":1,"role":"…"}`. 5 fails/15 min locks the IP for 5 min |
+| `POST /api/logout` | user | End this session |
 | `GET /api/state` | user | `{"time":"[…]","ip":"…","rssi":-58,"ntp":true,"uptime":1234,"relays":[true,false,false,true]}` |
 | `POST /api/relay` | user | Form fields `ch=0..3`, `on=1/0` (omit `on` to toggle). Returns `{"ch":0,"on":true}` |
 | `POST /relay/<i>` | user | Legacy shape: toggles relay `i` |
@@ -284,7 +293,8 @@ Basic (`admin` or `user`). `user` may call state + relay endpoints only.
 Example (toggle relay 1 with curl):
 
 ```sh
-curl -u user:mypass -X POST http://esp-home.local/api/relay --data "ch=0"
+curl -c jar -X POST http://esp-home.local/api/login --data "user=user&password=mypass"
+curl -b jar -X POST http://esp-home.local/api/relay --data "ch=0"
 ```
 
 ---
@@ -333,6 +343,8 @@ password from Settings. Changing the OTA password needs one reboot to apply.
 | Relay clicks but load stays off | Check COM/NO/NC wiring on the module; separate 5 V supply for 4 relays |
 | Switch 2 never registers | Missing 10 kΩ pull-up to 3V3 on GPIO16 |
 | Switch needs many presses | Mechanical bounce beyond 50 ms: increase `HA_DEBOUNCE_MS` in `src/config.h` |
+| Locked out ("Locked out - try again later") | 5 bad passwords in 15 min from your IP — wait 5 min, check caps lock. Attempts are in the log |
+| Dashboard bounces to /login | Session expired (30 min idle) or cookies blocked — log in again, enable cookies for the board |
 | Dashboard shows `[no-time]` | No internet for NTP; relays/switches unaffected; time fills in when online |
 | `esp-home.local` doesn't resolve | mDNS blocked by router/VPN: use the IP from the dashboard header or router list |
 | Board offline after WiFi password change | Press RESET 3× in 20 s → portal reopens, enter the new password |
@@ -362,6 +374,25 @@ is only needed for the very first flash (or if you forget the admin password).
 see §1.11. No USB, no reflash, settings and passwords are kept (only the WiFi
 credentials are erased).
 
+### 1.12 Always-on security hardening
+
+Because the board is online around the clock, sign-in is built for it:
+
+- **Session cookies, not per-request passwords.** After `/login` you hold an
+  HttpOnly, SameSite=Strict token that expires after 30 minutes idle. Your
+  password never travels again until you log back in.
+- **Brute-force lockout.** 5 wrong passwords in 15 minutes locks that IP out
+  for 5 minutes, and every attempt is logged with the attacker's IP.
+- **CSRF + clickjacking blocked.** State-changing requests must carry your
+  page's Origin (curl/API clients exempt), cookies refuse cross-site sending,
+  and the board sends `X-Frame-Options: DENY` + a content-security policy on
+  every response — malicious sites can't drive your relays.
+- **OTA download allowlist.** One-press updates only accept files from
+  GitHub's own hosts; a crafted URL can't make the board flash your laptop.
+- **Quiet failures.** Wrong logins get a flat "Bad login" (no hints about
+  which half was wrong), and unauthenticated visitors learn nothing about the
+  firmware version.
+
 **Will rapid switching wear the flash?** Log writes are batched (every 25
 events or 60 s) and relay state is one byte — years of normal use.
 
@@ -377,7 +408,7 @@ the supply, and never expose terminals.
 |---|---|
 | MCU | ESP8266 (ESP-12E / NodeMCU / D1 mini), 80 MHz |
 | Firmware size | ~432 KB flash (41%), ~37 KB RAM (46%) |
-| Web server | Port 80, HTTP Basic auth, JSON API |
+| Web server | Port 80, session-cookie auth, JSON API |
 | Time | NTP `in.pool.ntp.org`, +5:30, 5-min resync, boot force-sync |
 | Log | LittleFS `/log.txt`, 64 KB / 30-day rotation |
 | WiFi | STA + captive portal (`ESP-Setup-XXXX`, 5-min timeout), mDNS `esp-home.local` |
@@ -391,14 +422,14 @@ the supply, and never expose terminals.
 
 ```
 src/logic/    hardware-independent core (RelayBank, SwitchBank, LogStore,
-              AuthStore, ResetWindow, GhOTA version/release parsing,
-              scheduler) — covered by host unit tests
+              AuthStore, SessionStore, AttemptTracker, ResetWindow, GhOTA
+              version/release parsing, scheduler) — covered by host unit tests
 src/device/   ESP8266 drivers: portal, web UI, OTA (manual + GitHub),
               NTP, LittleFS storage, RTC triple-reset recovery
 src/common/   shared SHA-256 (password hashing)
 src/main.cpp  wiring + loop
 docs/         SOURCES.md (every reference), PRACTICES.md (coding standards)
-test/         8 Unity suites, 46 assertions (run: pio test -e native)
+test/         10 Unity suites, 59 assertions (run: pio test -e native)
 tools/soak_sim.cpp      30-day simulator: switch storms, WiFi drops,
                         millis() wrap (run: sh run_tests.sh)
 tools/mirror_to_ino.py  regenerates arduino/ from src/ (CI-enforced fresh)
@@ -418,11 +449,25 @@ the TX pin, hardcoded admin/admin. See `CHANGELOG.md`.
 ## 15. Security notes
 
 - No default credentials; first-boot setup gate blocks all mutating routes.
-- Passwords stored salted (per-chip salt) + SHA-256 — never plaintext.
-- Plain HTTP only: safe on a trusted home LAN, not for port-forwarding to the
-  internet. Put it behind VPN (e.g. Tailscale) for remote access.
-- If the admin password leaks, change it in Settings and rotate the OTA
-  password too.
+- Passwords stored salted (per-chip salt) + SHA-256 — never plaintext, never logged.
+- Sessions: random 128-bit tokens, HttpOnly + SameSite=Strict cookies, 30-min
+  sliding expiry, max 8 concurrent, swept every minute.
+- 5 failed logins in 15 minutes → that IP locked for 5 minutes (RAM-only;
+  a reboot clears lockouts) + every attempt logged with IP.
+- POSTs require a matching Origin (browsers always send one; curl exempt).
+- Every response carries `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and a CSP that bans
+  framing, plugins and off-origin content.
+- OTA URLs allowlisted to GitHub hosts (`github.com`,
+  `objects.githubusercontent.com`, `api.github.com`).
+- Password fields capped at 64 chars; usernames fixed to `admin`/`user`.
+- Deliberately **no HTTPS server**: TLS on an ESP8266 costs ~30 KB RAM per
+  session and self-signed certs train users to click through warnings (worse
+  than no TLS). Threat model is a trusted home LAN — keep it off the
+  internet; use VPN (e.g. Tailscale) or a reverse proxy for remote access.
+- If the admin password leaks: change it in Settings (kills nothing
+  retroactively — old sessions stay valid up to 30 min, so also reboot to
+  drop them), rotate the OTA password too.
 
 ## 16. License
 

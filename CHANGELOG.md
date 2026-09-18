@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.02 (2026-09-19) — always-on security
+- **Session auth replaces Basic:** `/login` page issues random 128-bit tokens
+  in HttpOnly + SameSite=Strict cookies, 30-min sliding expiry, max 8
+  sessions, `/api/logout`. Passwords no longer travel with every request.
+- **Brute-force lockout:** 5 bad logins in 15 min locks the IP for 5 min
+  (429); every attempt logged with IP. New `AttemptTracker` logic + 6 tests.
+- **CSRF + clickjacking blocked:** Origin check on all POSTs (curl exempt),
+  `X-Frame-Options: DENY`, `nosniff`, `no-referrer` and a framing/plugins
+  CSP on every response. New `SessionStore` logic + 7 tests.
+- **OTA allowlist:** one-press updates only accept `github.com`,
+  `objects.githubusercontent.com`, `api.github.com` (no LAN SSRF).
+- Flat "Bad login" (no user-enumeration hints), 64-char password cap,
+  version hidden from unauthenticated visitors.
+- Docs: SOURCES (OWASP session/auth, MDN cookies/CSP) + PRACTICES (session
+  discipline, lockouts, allowlists, secure headers) extended.
+- Firmware ~550 KB flash (53%), RAM 50% — still comfortable.
+
 ## v1.01 (2026-09-19)
 - **Triple-reset recovery:** press the RESET button 3× within 20 s to erase
   WiFi credentials and reopen the config portal. Count in RTC memory (resets

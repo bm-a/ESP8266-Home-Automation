@@ -4,12 +4,17 @@
 #include <Uri.h>
 #include "../config.h"
 #include "../logic/ghota.h"
+#include "../logic/guard.h"
+#include "../logic/session.h"
 #include "gh_update.h"
 #include "wifi_portal.h"
 
 static ESP8266WebServer s_server(80);
 static AppContext* s_web = nullptr;
 static bool s_uploadAllowed = false;
+static ha::SessionStore s_sessions;
+static ha::AttemptTracker s_guard;
+static uint32_t s_lastSweep = 0;
 
 // Roles as plain ints: Arduino IDE hoists prototypes above enum definitions,
 // so a custom enum type in signatures breaks the single-file sketch build.
@@ -17,51 +22,85 @@ static const int R_NONE = 0;
 static const int R_USER = 1;
 static const int R_ADMIN = 2;
 
-// --- tiny base64 decoder (for "Basic <b64>") ---
-static int b64val(char c) {
-  if (c >= 'A' && c <= 'Z') return c - 'A';
-  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-  if (c >= '0' && c <= '9') return c - '0' + 52;
-  if (c == '+') return 62;
-  if (c == '/') return 63;
-  return -1;
+static const char* kCookieName = "HA_SESSION=";
+
+// Every response carries these (OWASP secure-headers cheat sheet, embedded
+// subset: no framing, no MIME sniffing, no plugins, tight referrer).
+static void sendSecure(int code, const String& type, const String& body) {
+  s_server.sendHeader("X-Content-Type-Options", "nosniff");
+  s_server.sendHeader("X-Frame-Options", "DENY");
+  s_server.sendHeader("Referrer-Policy", "no-referrer");
+  s_server.sendHeader("Content-Security-Policy",
+                      "default-src 'self'; script-src 'unsafe-inline'; "
+                      "object-src 'none'; base-uri 'self'; "
+                      "frame-ancestors 'none'");
+  sendSecure(code, type, body);
 }
-static std::string b64decode(const String& in) {
-  std::string out;
-  int val = 0, bits = 0;
-  for (size_t i = 0; i < in.length(); i++) {
-    char c = in[i];
-    if (c == '=') break;
-    int v = b64val(c);
-    if (v < 0) continue;
-    val = (val << 6) | v;
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out += (char)((val >> bits) & 0xFF);
-    }
-  }
-  return out;
+
+static std::string sessionToken() {
+  String c = s_server.header("Cookie");
+  int i = c.indexOf(kCookieName);
+  if (i < 0) return std::string();
+  int j = c.indexOf(';', (size_t)(i + 11));
+  String t = (j < 0) ? c.substring(i + 11) : c.substring(i + 11, j);
+  t.trim();
+  return std::string(t.c_str());
+}
+
+static std::string clientIp() {
+  return std::string(s_server.client().remoteIP().toString().c_str());
 }
 
 static int currentRole() {
-  String h = s_server.header("Authorization");
-  if (!h.startsWith("Basic ")) return R_NONE;
-  std::string cred = b64decode(h.substring(6));
-  size_t pos = cred.find(':');
-  if (pos == std::string::npos) return R_NONE;
-  std::string user = cred.substr(0, pos);
-  std::string pass = cred.substr(pos + 1);
-  if (user == "admin" && s_web->auth->verifyAdmin(pass)) return R_ADMIN;
-  if (user == "user" && s_web->auth->verifyUser(pass)) return R_USER;
+  int role = s_sessions.validate(sessionToken(), millis());
+  if (role == ha::kRoleAdmin) return R_ADMIN;
+  if (role == ha::kRoleUser) return R_USER;
   return R_NONE;
+}
+
+// CSRF: state-changing requests must come from our own pages (Origin match)
+// or from non-browser clients (no Origin header, e.g. curl). Cookies are
+// SameSite=Strict as the second layer.
+static bool originOk() {
+  String o = s_server.header("Origin");
+  if (o.length() == 0) return true;
+  String host = s_server.hostHeader();
+  int s = o.indexOf("://");
+  String oh = (s >= 0) ? o.substring(s + 3) : o;
+  int c = oh.indexOf(':');
+  if (c >= 0) oh = oh.substring(0, c);
+  int sl = oh.indexOf('/');
+  if (sl >= 0) oh = oh.substring(0, sl);
+  return oh == host;
 }
 
 static bool needAuth(int minimum) {
   int r = currentRole();
-  if (r >= minimum && r != R_NONE) return false;
-  s_server.requestAuthentication();
+  if (r >= minimum && r != R_NONE) {
+    if (s_server.method() == HTTP_POST && !originOk()) {
+      sendSecure(403, "text/plain", "Bad origin");
+      return true;
+    }
+    return false;
+  }
+  String uri = s_server.uri();
+  if (uri.startsWith("/api/")) {
+    sendSecure(401, "application/json", "{\"error\":\"login\"}");
+  } else {
+    s_server.sendHeader("Location", "/login");
+    sendSecure(302, "text/plain", "Login required");
+  }
   return true;
+}
+
+static void setSessionCookie(const std::string& token) {
+  String v = "HA_SESSION=" + String(token.c_str()) +
+             "; Path=/; HttpOnly; SameSite=Strict; Max-Age=1800";
+  s_server.sendHeader("Set-Cookie", v);
+}
+
+static void clearSessionCookie() {
+  s_server.sendHeader("Set-Cookie", "HA_SESSION=; Path=/; Max-Age=0");
 }
 
 // First-boot gate: force admin password setup before anything else.
@@ -71,7 +110,7 @@ static bool setupGate() {
   if (uri == "/setup" || uri == "/api/setup" || uri == "/api/state")
     return false;
   s_server.sendHeader("Location", "/setup");
-  s_server.send(302, "text/plain", "Setup required");
+  sendSecure(302, "text/plain", "Setup required");
   return true;
 }
 
@@ -95,9 +134,11 @@ static void page(const String& title, const String& body) {
                 title + "</title><style>" + kCss +
                 "</style></head><body><main><nav><a href='/'>Home</a>"
                 "<a href='/logs'>Logs</a><a href='/settings'>Settings</a>"
-                "<a href='/update'>OTA</a></nav><h1>" +
+                "<a href='/update'>OTA</a><a href='#' onclick=\"fetch('/api/logout',"
+                "{method:'POST'}).then(()=>location='/login');return false\">"
+                "Logout</a></nav><h1>" +
                 title + "</h1>" + body + "</main></body></html>";
-  s_server.send(200, "text/html", html);
+  sendSecure(200, "text/html", html);
 }
 
 static void handleRoot() {
@@ -107,7 +148,9 @@ static void handleRoot() {
       "<div class='card'><div id='st'>loading…</div></div>"
       "<div class='card' id='relays'></div>"
       "<script>"
-      "async function st(){const r=await fetch('/api/state');const j=await r.json();"
+      "async function st(){const r=await fetch('/api/state');"
+      "if(r.status===401){location='/login';return;}"
+      "const j=await r.json();"
       "document.getElementById('st').innerHTML='Time '+j.time+' | IP '+j.ip+' | RSSI '+j.rssi+' dBm';"
       "let h='';j.relays.forEach((s,i)=>{h+='<div class=row><b>Relay '+(i+1)+'</b> '+(s?'ON':'OFF')+"
       "' <button '+(s?'':'class=off')+' onclick=\"setR('+i+','+(s?'0':'1')+')\">'+(s?'Turn OFF':'Turn ON')+'</button></div>'});"
@@ -120,7 +163,7 @@ static void handleRoot() {
 static void handleSetup() {
   if (!s_web->auth->adminMustChange()) {
     s_server.sendHeader("Location", "/");
-    s_server.send(302, "text/plain", "Already set up");
+    sendSecure(302, "text/plain", "Already set up");
     return;
   }
   String body =
@@ -136,19 +179,101 @@ static void handleSetup() {
 
 static void handleApiSetup() {
   if (!s_web->auth->adminMustChange()) {
-    s_server.send(403, "text/plain", "Already set up");
+    sendSecure(403, "text/plain", "Already set up");
     return;
   }
   String pw = s_server.arg("password");
   if (pw.length() < 8) {
-    s_server.send(400, "text/plain", "Password must be >= 8 characters");
+    sendSecure(400, "text/plain", "Password must be >= 8 characters");
     return;
   }
   s_web->auth->setAdminPassword(pw.c_str());
   if (s_web->otaPassword->empty()) *s_web->otaPassword = pw.c_str();
   s_web->saveAll();
   s_web->addLog("Admin password set (first boot)");
-  s_server.send(200, "text/plain", "OK - now log in as admin");
+  sendSecure(200, "text/plain", "OK - now log in as admin");
+}
+
+static void handleLoginPage() {
+  if (!s_web->auth->adminMustChange() && currentRole() != R_NONE) {
+    s_server.sendHeader("Location", "/");
+    sendSecure(302, "text/plain", "Already in");
+    return;
+  }
+  String body =
+      "<div class='card'><label>User<select id='u'>"
+      "<option value='admin'>admin</option>"
+      "<option value='user'>user</option></select></label>"
+      "<label>Password<input type='password' id='p'></label>"
+      "<button onclick='li()'>Log in</button><p id='m'></p></div>"
+      "<script>async function li(){const f=new URLSearchParams({user:"
+      "document.getElementById('u').value,password:document.getElementById('p')."
+      "value});const r=await fetch('/api/login',{method:'POST',body:f});"
+      "if(r.ok)location='/';else "
+      "document.getElementById('m').innerText=await r.text();}</script>";
+  page("Log in", body);
+}
+
+static void handleApiLogin() {
+  if (!originOk()) {
+    sendSecure(403, "text/plain", "Bad origin");
+    return;
+  }
+  std::string ip = clientIp();
+  uint32_t now = millis();
+  // 5 failures in 15 min -> 5 min lockout (brute-force guard).
+  if (s_guard.isLocked(ip, now)) {
+    sendSecure(429, "text/plain", "Locked out - try again later");
+    return;
+  }
+  String user = s_server.arg("user");
+  String pw = s_server.arg("password");
+  int role = R_NONE;
+  if (pw.length() <= 64) {  // length cap: no 10 MB hash jobs
+    if (user == "admin" && s_web->auth->verifyAdmin(pw.c_str()))
+      role = R_ADMIN;
+    else if (user == "user" && s_web->auth->verifyUser(pw.c_str()))
+      role = R_USER;
+  }
+  if (role == R_NONE) {
+    bool locked = s_guard.noteFail(ip, now);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Failed login as '%s' from %s%s", user.c_str(),
+             ip.c_str(), locked ? " (IP locked)" : "");
+    s_web->addLog(msg);
+    sendSecure(locked ? 429 : 401, "text/plain",
+               locked ? "Locked out - try again later" : "Bad login");
+    return;
+  }
+  s_guard.noteSuccess(ip);
+  std::string token = s_sessions.login(
+      role == R_ADMIN ? ha::kRoleAdmin : ha::kRoleUser, now);
+  if (token.empty()) {
+    sendSecure(503, "text/plain", "Session table full - retry shortly");
+    return;
+  }
+  setSessionCookie(token);
+  sendSecure(200, "application/json",
+             role == R_ADMIN ? "{\"ok\":1,\"role\":\"admin\"}"
+                             : "{\"ok\":1,\"role\":\"user\"}");
+}
+
+static void handleApiLogout() {
+  s_sessions.logout(sessionToken());
+  clearSessionCookie();
+  sendSecure(200, "text/plain", "Logged out");
+}
+
+// OTA download URLs must point at GitHub (blocks SSRF to the LAN via a
+// crafted admin request or a compromised release JSON).
+static bool ghUrlAllowed(const std::string& url) {
+  static const char* kPrefix = "https://";
+  if (url.compare(0, 8, kPrefix) != 0) return false;
+  size_t end = url.find('/', 8);
+  std::string host =
+      url.substr(8, end == std::string::npos ? end : end - 8);
+  return host == "github.com" || host == "objects.githubusercontent.com" ||
+         host == "api.github.com";
 }
 
 static String stateJson() {
@@ -170,19 +295,19 @@ static String stateJson() {
 static void handleApiState() {
   if (setupGate()) return;
   if (needAuth(R_USER)) return;
-  s_server.send(200, "application/json", stateJson());
+  sendSecure(200, "application/json", stateJson());
 }
 
 static void applyRelay(int ch, bool on, const char* src) {
   if (!s_web->relays->set(ch, on)) {
-    s_server.send(400, "text/plain", "Invalid channel");
+    sendSecure(400, "text/plain", "Invalid channel");
     return;
   }
   digitalWrite(s_web->relayPins[ch], s_web->relays->levelForChannel(ch));
   char msg[64];
   snprintf(msg, sizeof(msg), "Relay %d %s (%s)", ch + 1, on ? "ON" : "OFF", src);
   s_web->addLog(msg);
-  s_server.send(200, "application/json",
+  sendSecure(200, "application/json",
                 "{\"ch\":" + String(ch) + ",\"on\":" + (on ? "true" : "false") + "}");
 }
 
@@ -201,7 +326,7 @@ static void handleRelayToggleLegacy(int i) {
   if (setupGate()) return;
   if (needAuth(R_USER)) return;
   if (i < 0 || i >= s_web->channels) {
-    s_server.send(400, "text/plain", "Invalid relay index");
+    sendSecure(400, "text/plain", "Invalid relay index");
     return;
   }
   applyRelay(i, !s_web->relays->get(i), "web");
@@ -226,7 +351,7 @@ static void handleApiLogs() {
     out += String(l.c_str());
     out += "\n";
   }
-  s_server.send(200, "text/plain", out);
+  sendSecure(200, "text/plain", out);
 }
 
 static void handleSettings() {
@@ -258,13 +383,13 @@ static void handleAdminPw() {
   if (needAuth(R_ADMIN)) return;
   String pw = s_server.arg("password");
   if (pw.length() < 8) {
-    s_server.send(400, "text/plain", "Min 8 characters");
+    sendSecure(400, "text/plain", "Min 8 characters");
     return;
   }
   s_web->auth->setAdminPassword(pw.c_str());
   s_web->saveAll();
   s_web->addLog("Admin password changed");
-  s_server.send(200, "text/plain", "Admin password changed");
+  sendSecure(200, "text/plain", "Admin password changed");
 }
 
 static void handleUserSet() {
@@ -273,14 +398,14 @@ static void handleUserSet() {
   bool en = s_server.arg("enabled") == "1";
   String pw = s_server.arg("password");
   if (en && pw.length() < 4) {
-    s_server.send(400, "text/plain", "User password min 4 characters");
+    sendSecure(400, "text/plain", "User password min 4 characters");
     return;
   }
   s_web->auth->setUserEnabled(en);
   if (pw.length()) s_web->auth->setUserPassword(pw.c_str());
   s_web->saveAll();
   s_web->addLog(en ? "User account enabled" : "User account disabled");
-  s_server.send(200, "text/plain", "User settings saved");
+  sendSecure(200, "text/plain", "User settings saved");
 }
 
 static void handleOtaPw() {
@@ -288,19 +413,19 @@ static void handleOtaPw() {
   if (needAuth(R_ADMIN)) return;
   String pw = s_server.arg("password");
   if (pw.length() < 8) {
-    s_server.send(400, "text/plain", "Min 8 characters");
+    sendSecure(400, "text/plain", "Min 8 characters");
     return;
   }
   *s_web->otaPassword = pw.c_str();
   s_web->saveAll();
   s_web->addLog("OTA password changed (applies after reboot)");
-  s_server.send(200, "text/plain", "OTA password saved - reboot to apply");
+  sendSecure(200, "text/plain", "OTA password saved - reboot to apply");
 }
 
 static void handlePortal() {
   if (setupGate()) return;
   if (needAuth(R_ADMIN)) return;
-  s_server.send(200, "text/plain", "Opening portal…");
+  sendSecure(200, "text/plain", "Opening portal…");
   delay(500);
   s_web->requestPortal();
 }
@@ -308,7 +433,7 @@ static void handlePortal() {
 static void handleRestart() {
   if (setupGate()) return;
   if (needAuth(R_ADMIN)) return;
-  s_server.send(200, "text/plain", "Rebooting…");
+  sendSecure(200, "text/plain", "Rebooting…");
   delay(500);
   s_web->requestReboot();
 }
@@ -363,10 +488,10 @@ static void handleUpdateDone() {
   if (setupGate()) return;
   if (needAuth(R_ADMIN)) return;
   if (!s_uploadAllowed || Update.hasError()) {
-    s_server.send(403, "text/plain", "Update failed or not authorized");
+    sendSecure(403, "text/plain", "Update failed or not authorized");
     return;
   }
-  s_server.send(200, "text/plain", "Update OK - rebooting…");
+  sendSecure(200, "text/plain", "Update OK - rebooting…");
   delay(500);
   s_web->requestReboot();  // via main: persists + disarms reset detector
 }
@@ -385,24 +510,24 @@ static void handleApiGhCheck() {
   j += (ok && ha::ghota::updateAvailable(s_web->fwVersion, tag)) ? "true"
                                                                  : "false";
   j += "}";
-  s_server.send(200, "application/json", j);
+  sendSecure(200, "application/json", j);
 }
 
 static void handleApiGhUpdate() {
   if (setupGate()) return;
   if (needAuth(R_ADMIN)) return;
   std::string url = s_server.arg("url").c_str();
-  if (url.empty()) {
-    s_server.send(400, "text/plain", "Missing url");
+  if (url.empty() || !ghUrlAllowed(url)) {
+    sendSecure(400, "text/plain", "URL not allowed");
     return;
   }
   auto logFn = [](const std::string& m) { s_web->addLog(m); };
   s_server.sendHeader("Connection", "close");
   if (!ghDownloadAndFlash(url, logFn)) {
-    s_server.send(500, "text/plain", "Download/flash failed - see log");
+    sendSecure(500, "text/plain", "Download/flash failed - see log");
     return;
   }
-  s_server.send(200, "text/plain", "Update OK - rebooting…");
+  sendSecure(200, "text/plain", "Update OK - rebooting…");
   delay(500);
   s_web->requestReboot();
 }
@@ -414,13 +539,21 @@ static void handleNotFound() {
     handleRelayToggleLegacy(uri.substring(7).toInt());
     return;
   }
-  s_server.send(404, "text/plain", "Not found");
+  sendSecure(404, "text/plain", "Not found");
 }
 
 void webBegin(AppContext* ctx) {
   s_web = ctx;
-  s_server.collectHeaders("Authorization");
+  s_sessions.configure(8, 1800000);  // 8 sessions, 30 min sliding expiry
+  s_sessions.setRng([]() -> uint32_t { return ESP.random(); });
+  s_guard.configure(5, 900000, 300000, 16);  // 5 fails/15 min -> 5 min lock
+  // This core's collectHeaders() is variadic-template-only: array form
+  // resolves to the template and fails to compile. Pass headers directly.
+  s_server.collectHeaders("Cookie", "Origin");
   s_server.on("/", HTTP_GET, handleRoot);
+  s_server.on("/login", HTTP_GET, handleLoginPage);
+  s_server.on("/api/login", HTTP_POST, handleApiLogin);
+  s_server.on("/api/logout", HTTP_POST, handleApiLogout);
   s_server.on("/setup", HTTP_GET, handleSetup);
   s_server.on("/api/setup", HTTP_POST, handleApiSetup);
   s_server.on("/api/state", HTTP_GET, handleApiState);
@@ -441,4 +574,11 @@ void webBegin(AppContext* ctx) {
   s_server.begin();
 }
 
-void webLoop() { s_server.handleClient(); }
+void webLoop() {
+  s_server.handleClient();
+  uint32_t now = millis();
+  if ((uint32_t)(now - s_lastSweep) >= 60000) {
+    s_lastSweep = now;
+    s_sessions.sweep(now);  // drop expired sessions once a minute
+  }
+}

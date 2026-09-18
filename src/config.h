@@ -10,7 +10,7 @@
 
 #define HA_CHANNELS 4
 
-#define HA_VERSION "1.01"
+#define HA_VERSION "1.02"
 
 // Triple-reset recovery: this many RESET presses inside the window below
 // wipes WiFi credentials and opens the config portal.

@@ -86,6 +86,26 @@ types in signatures** (roles are `int`, contexts are forward-declared in the
 mirror preamble). `struct RtcSlot` and `struct AppContext` forward
 declarations in `tools/mirror_to_ino.py` exist for exactly this reason.
 
+## OWASP Authentication + Session Management Cheat Sheets
+
+- **Session tokens over Basic auth**: per-request passwords replay the secret
+  and can't be revoked; opaque, random, expirable server-side sessions can.
+  128-bit tokens from `ESP.random()` (RF-noise seeded), 30-min sliding
+  expiry, cap + sweep (`src/logic/session.h`).
+- **Brute-force defense**: count failures per identifier, sliding window,
+  temporary lockout, log with IP — and never reveal whether the username or
+  the password was wrong (`src/logic/guard.h`, flat "Bad login").
+- **CSRF**: SameSite cookies + Origin/Referer validation on state-changing
+  requests (OWASP CSRF Prevention Cheat Sheet, "custom headers / origin
+  check" branch — no per-form tokens needed for this size).
+
+## MDN Web Docs — Set-Cookie, SameSite, CSP
+
+`HttpOnly; SameSite=Strict; Max-Age=1800; Path=/` semantics; `X-Frame-Options:
+DENY`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy`
+(`frame-ancestors 'none'`, `object-src 'none'`). `Secure` is omitted
+deliberately — no HTTPS server (see README §15 for the reasoning).
+
 ## ESP8266WebServer examples (FSBrowser, HTTPUpdateServer)
 
 Authenticated-upload pattern: `server.upload()` chunks → `Update.write`
